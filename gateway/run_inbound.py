@@ -863,6 +863,12 @@ class GatewayInboundMixin(
         if _handled:
             return _result
 
+        if getattr(event, "ephemeral_context_ref", None) is not None:
+            # Volatile context is resolved only at a user-turn boundary; never splice
+            # its text alone into an already-running turn via steer/redirect.
+            self._queue_or_replace_pending_event(_quick_key, event)
+            return None
+
         effective_busy_input_mode = ("interrupt" if self._clarify_takeover(event, _quick_key)
                                      else self._effective_busy_input_mode(source))
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):

@@ -24,7 +24,7 @@ from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import hash_for_log, typing_metadata_for_turn
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, persisted_user_metadata_for_event,
@@ -33,7 +33,7 @@ from gateway.response_filters import (
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
-    build_session_context,
+    build_session_context, is_shared_multi_user_session,
 )
 from gateway.session_context import scoped_turn_actor
 from gateway.session_transcript import TranscriptReadError
@@ -172,6 +172,39 @@ from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
+    def _resolve_event_volatile_user_context(self, event: MessageEvent) -> Optional[str]:
+        """Resolve an adapter-owned capability once at a foreground turn boundary."""
+        if (
+            event is None
+            or getattr(event, "ephemeral_context_ref", None) is None
+            or getattr(event, "_ephemeral_context_blocked", False)
+            or getattr(event, "internal", False)
+            or getattr(event, "message_type", None) not in {MessageType.TEXT, MessageType.COMMAND}
+            or bool(getattr(event, "media_urls", None))
+            or not getattr(event, "message_id", None)
+        ):
+            return None
+        source = getattr(event, "source", None)
+        config = getattr(self, "config", None)
+        if source is None or is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+        ):
+            return None
+        # The opaque reference names adapter-owned RAM on the receiving transport,
+        # so resolve it through the canonical intake identity. A routed profile may
+        # execute elsewhere, but no other adapter may read this capability.
+        adapter = self._intake_adapter_for(source)
+        resolver = getattr(adapter, "_resolve_ephemeral_user_context_for_dispatch_sync", None)
+        if not callable(resolver):
+            return None
+        try:
+            resolved = resolver(event)
+        except Exception:
+            logger.warning("Volatile user context resolution failed closed", exc_info=True)
+            return None
+        return resolved.strip() if isinstance(resolved, str) and resolved.strip() else None
 
     def _event_thread_metadata(self, event, source):
         """Thread metadata for a send that replies to ``event`` on ``source``."""
@@ -207,6 +240,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         history, message_text = prepared.history, prepared.message_text
 
         try:
+            volatile_user_context = self._resolve_event_volatile_user_context(event)
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).
             _run_start_session_id = session_entry.session_id
@@ -230,6 +264,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     "gateway_input_owner": prepared.persistence_owner, **persisted_user_metadata_for_event(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
+                volatile_user_context=volatile_user_context,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -1681,6 +1716,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
+        next_volatile_user_context = None
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -1724,6 +1760,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 # A drained human turn re-pins its channel inputs; make them durable like a first turn.
                 await self._persist_prompt_pins(next_session_key, session_id)
             next_message_type = getattr(pending_event, "message_type", None)
+            next_volatile_user_context = self._resolve_event_volatile_user_context(
+                pending_event
+            )
         else:
             # Event-less interrupt/steer follow-ups continue the effective prompt
             # of the turn they are recursively following.
@@ -1771,6 +1810,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                     channel_prompt=next_channel_prompt, message_type=next_message_type,
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
+                    volatile_user_context=next_volatile_user_context,
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
@@ -2050,6 +2090,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         reply_expected: Optional[bool] = None,
+        volatile_user_context: Optional[str] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -2093,7 +2134,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
-            persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
+            persist_user_display_metadata=persist_user_display_metadata,
+            volatile_user_context=volatile_user_context,
+            scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(

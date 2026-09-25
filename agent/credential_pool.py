@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
-from agent.credential_pool_errors import _normalize_error_context, redact_error_text
+from agent.credential_pool_errors import (
+    CREDENTIAL_PERSIST_FAILED_REASON,
+    _TERMINAL_AUTH_REASONS,
+    _normalize_error_context,
+    redact_error_text,
+)
 from agent.credential_pool_selection import CredentialPoolSelectionMixin
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
 
@@ -85,23 +90,6 @@ STATUS_EXHAUSTED = "exhausted"
 # rotation unconditionally and only clear when an explicit write-side sync
 # (e.g. ``_save_codex_tokens`` after a fresh device-code login) rewrites tokens.
 STATUS_DEAD = "dead"
-
-# OAuth error reasons that mean the credential is permanently invalid
-# server-side (OpenAI Codex, Anthropic, xAI, Google OAuth, RFC 6749/6750/7009).
-_TERMINAL_AUTH_REASONS = frozenset({
-    "token_invalidated",
-    "token_revoked",
-    "invalid_token",
-    "invalid_grant",
-    "unauthorized_client",
-    "refresh_token_reused",  # single-use refresh token consumed by another process
-})
-
-# Locally generated terminal reason (no HTTP status): a refresh POST rotated a
-# single-use pair but the replacement never reached its authoritative store, so
-# the pre-rotation token still on disk is already spent. Kept out of
-# _TERMINAL_AUTH_REASONS (upstream 401 reasons) and handled explicitly.
-CREDENTIAL_PERSIST_FAILED_REASON = "credential_persist_failed"
 
 # DEAD ``manual:*`` entries are pruned after this quiet window — they have no
 # singleton to re-seed from and the user can re-add via ``hermes auth add``.

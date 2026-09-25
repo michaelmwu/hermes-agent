@@ -720,6 +720,15 @@ class GatewayBusySessionMixin:
     ) -> GatewayRunner._BusySteerOutcome:
         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if getattr(event, "ephemeral_context_ref", None) is not None:
+            # A volatile capability belongs to its own future foreground turn. Steering
+            # or redirecting only the text into the already-running turn would either
+            # lose the context or apply it to the wrong user-message boundary.
+            logger.debug(
+                "Demoting volatile-context busy input to queue for session %s",
+                session_key,
+            )
+            effective_mode = "queue"
         # Steer injects mid-run via running_agent.steer(), falling back to queue (nothing lost) when
         # the agent isn't running yet, lacks steer(), or the payload is empty. Interrupt is demoted
         # to queue while subagents run (interrupt() would abort them); /stop and /new still cancel all.
@@ -1234,6 +1243,7 @@ class GatewayBusySessionMixin:
             channel_prompt=event.channel_prompt, channel_context=event.channel_context,
             internal=event.internal, timestamp=event.timestamp,
             edit_revision=event.edit_revision,  # an edited /queue is its own input (admission id)
+            ephemeral_context_ref=event.ephemeral_context_ref,
         )
 
     async def _busy_moa_command(self, event: MessageEvent, quick_key: str, source):
@@ -1264,9 +1274,15 @@ class GatewayBusySessionMixin:
                 text=steer_text, message_type=MessageType.TEXT, source=event.source,
                 message_id=event.message_id, channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context, edit_revision=event.edit_revision,
+                ephemeral_context_ref=event.ephemeral_context_ref,
             ), adapter, reply):
                 return None  # its commit sends the reply
             return reply
+
+        if event.ephemeral_context_ref is not None:
+            return _queue_fallback(
+                "Live location context requires its own turn — /steer queued for the next turn."
+            )
 
         if running_agent is _AGENT_PENDING_SENTINEL:
             return await _queue_fallback(t("gateway.steer.queued_starting"))

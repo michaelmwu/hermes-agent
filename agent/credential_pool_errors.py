@@ -6,11 +6,19 @@ import time
 from typing import Any, Iterable, Optional
 
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
-from agent.redact import redact_sensitive_text
+from agent.redact import has_volatile_sensitive_text, redact_sensitive_text
 from agent.retry_utils import reset_delay_from_message
 
 # Shorter values are too likely to collide with ordinary words in the error text.
 _MIN_KNOWN_SECRET_LEN = 8
+
+# OAuth error reasons that mean the credential is permanently invalid server-side.
+_TERMINAL_AUTH_REASONS = frozenset({
+    "token_invalidated", "token_revoked", "invalid_token", "invalid_grant",
+    "unauthorized_client", "refresh_token_reused",
+})
+# Local terminal reason: a single-use refresh token rotated without a durable replacement.
+CREDENTIAL_PERSIST_FAILED_REASON = "credential_persist_failed"
 
 
 def redact_error_text(text: str, known_secrets: Iterable[Optional[str]] = ()) -> str:
@@ -30,6 +38,14 @@ def _normalize_error_context(
     error_context: Optional[dict[str, Any]], known_secrets: Iterable[Optional[str]] = ()
 ) -> dict[str, Any]:
     if not isinstance(error_context, dict):
+        return {}
+    if has_volatile_sensitive_text():
+        # A provider can echo pieces of an ambient snapshot in either text or reset_at.
+        # Keep only understood reason codes and use the local cooldown policy.
+        reason = error_context.get("reason")
+        canonical = reason.strip().lower() if isinstance(reason, str) else ""
+        if canonical in _TERMINAL_AUTH_REASONS or canonical == CREDENTIAL_PERSIST_FAILED_REASON:
+            return {"reason": canonical}
         return {}
     known_secrets = tuple(known_secrets)
     normalized: dict[str, Any] = {}

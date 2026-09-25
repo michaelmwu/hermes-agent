@@ -11,6 +11,8 @@ import os
 import re
 import shlex
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from urllib.parse import unquote_plus
 
 # Shared with agent/file_safety's read-block list so the two defenses can't
@@ -51,6 +53,73 @@ logger = logging.getLogger(__name__)
 # RecursionError on the way to the model.
 REDACT_WALK_MAX_DEPTH = 320
 REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
+_VOLATILE_SENSITIVE_TEXT: ContextVar[tuple[str, ...]] = ContextVar(
+    "hermes_volatile_sensitive_text", default=()
+)
+_VOLATILE_REDACTION = "«redacted-volatile-context»"
+_TELEGRAM_LOG_COORDINATE_RE = re.compile(
+    r"((?:latitude|longitude)\b[\"']?\s*[:=]\s*)"
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+    re.IGNORECASE,
+)
+
+
+def _volatile_redaction_literals(value: object) -> tuple[str, ...]:
+    """Return exact raw/JSON spellings that must not escape the current turn."""
+    text = value if isinstance(value, str) else ""
+    if not text:
+        return ()
+    candidates: list[str] = [text, json.dumps(text, ensure_ascii=False)[1:-1]]
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            candidates.extend((line, json.dumps(line, ensure_ascii=False)[1:-1]))
+            # Provider errors often echo only the rejected scalar rather than the
+            # complete request line. Location snapshots are Hermes-authored, so safely
+            # recognize their two coordinate fields and bind the numeric RHS too.
+            match = re.fullmatch(
+                r"(?:Latitude|Longitude):\s*"
+                r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+                line,
+            )
+            if match:
+                candidates.append(match.group(1))
+    # Longest-first prevents a line replacement from defeating the full-value match.
+    return tuple(sorted(set(candidates), key=lambda candidate: len(candidate), reverse=True))
+
+
+@contextmanager
+def bind_volatile_sensitive_text(*values: object):
+    """Temporarily add exact private literals to mandatory log/error redaction."""
+    literal_set: set[str] = set(_VOLATILE_SENSITIVE_TEXT.get())
+    for value in values:
+        literal_set.update(_volatile_redaction_literals(value))
+    literals = tuple(sorted(literal_set, key=lambda literal: len(literal), reverse=True))
+    token = _VOLATILE_SENSITIVE_TEXT.set(literals)
+    try:
+        yield
+    finally:
+        _VOLATILE_SENSITIVE_TEXT.reset(token)
+
+
+def has_volatile_sensitive_text() -> bool:
+    """Whether this execution context currently carries non-persistent text."""
+    return bool(_VOLATILE_SENSITIVE_TEXT.get())
+
+
+def volatile_sensitive_literals() -> tuple[str, ...]:
+    """Snapshot bound literals for work deferred to another thread (notably logs)."""
+    return _VOLATILE_SENSITIVE_TEXT.get()
+
+
+def _redact_volatile_sensitive_text(
+    text: str, literals: tuple[str, ...] = (),
+) -> str:
+    for group in (_VOLATILE_SENSITIVE_TEXT.get(), literals):
+        for literal in group:
+            text = text.replace(literal, _VOLATILE_REDACTION)
+    return text
+
 
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
@@ -1525,6 +1594,9 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if text is None:
         return None
     text = text if isinstance(text, str) else str(text)
+    # Volatile privacy bindings are mandatory even when ordinary credential
+    # redaction is explicitly disabled by the operator.
+    text = _redact_volatile_sensitive_text(text)
     if not text:
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
@@ -1976,9 +2048,18 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         # Other handlers must receive the original message and exception cache.
         safe_record = copy.copy(record)
-        safe_record.msg = _LOG_UNSAFE_CHARS.sub(" ", redact_sensitive_text(record.getMessage()))
+        # The listener thread has no turn ContextVar. Scrub before normalizing log lines.
+        literals = getattr(record, "_hermes_volatile_sensitive_text", ())
+        message = _redact_volatile_sensitive_text(record.getMessage(), literals)
+        safe_record.msg = _LOG_UNSAFE_CHARS.sub(" ", redact_sensitive_text(message))
         safe_record.args = None
-        formatted = redact_log_urls(redact_sensitive_text(super().format(safe_record)))
+        rendered = _redact_volatile_sensitive_text(super().format(safe_record), literals)
+        formatted = redact_log_urls(redact_sensitive_text(rendered))
+        if record.name == "telegram" or record.name.startswith("telegram."):
+            # PTB can log failed updates outside any Hermes turn binding.
+            formatted = _TELEGRAM_LOG_COORDINATE_RE.sub(
+                lambda match: match.group(1) + _VOLATILE_REDACTION, formatted
+            )
         # aiohttp's access line carries the raw request target, and webhook platforms that cannot
         # send headers authenticate in the query string (BlueBubbles ``?password=``). An adapter's
         # own ``access_log=None`` does not reach the shared listener that serves multiplexed

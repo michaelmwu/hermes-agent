@@ -617,7 +617,7 @@ class TestWireInvariant:
         assert first_wire["content"] == f"where am I?\n\nPLUGIN-CTX\n\n{snapshot}"
         assert "37.7749" not in json.dumps(first_result["messages"])
 
-        history = db.get_messages_as_conversation(sid)
+        history = conversation(db, sid)
         durable = json.dumps(history)
         assert "37.7749" not in durable
         assert history[0]["message_id"] == "tg-1"
@@ -650,7 +650,7 @@ class TestWireInvariant:
                 persist_user_platform_id="tg-rewritten",
             )
 
-        history = db.get_messages_as_conversation(sid)
+        history = conversation(db, sid)
         history[0]["content"] = "[compressed summary]"
         history[0].pop("api_content", None)
         handler.captured_requests = []

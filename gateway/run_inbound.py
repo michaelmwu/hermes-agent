@@ -828,6 +828,8 @@ class GatewayInboundMixin(
         must NOT also be admitted as its own turn; False when the caller should admit it (queue mode,
         a demotion, or an interrupt — the ended turn lets the FIFO run the follow-up next)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if getattr(event, "ephemeral_context_ref", None) is not None:
+            return False  # the committed follow-up resolves the reference at its own turn boundary
         superseded = self._clarify_takeover(event, _quick_key)
         mode = "interrupt" if superseded else self._effective_busy_input_mode(source)
         if (mode == "interrupt" and not superseded and not getattr(event, "internal", False)

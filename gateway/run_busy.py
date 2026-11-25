@@ -1221,6 +1221,8 @@ class GatewayBusySessionMixin:
         adapter = self._delivery_adapter_for(source)
         if adapter:
             queued = self._queued_turn_event(event, queued_text, has_media)
+            queued.ephemeral_context_ref = event.ephemeral_context_ref
+            queued._ephemeral_context_blocked = event._ephemeral_context_blocked
             if await self._queue_command_turn(quick_key, event, queued, adapter, t("gateway.queue.queued")):
                 return None  # its commit sends the ack
         depth = self._queue_depth(quick_key, adapter=adapter)
@@ -1243,7 +1245,6 @@ class GatewayBusySessionMixin:
             channel_prompt=event.channel_prompt, channel_context=event.channel_context,
             internal=event.internal, timestamp=event.timestamp,
             edit_revision=event.edit_revision,  # an edited /queue is its own input (admission id)
-            ephemeral_context_ref=event.ephemeral_context_ref,
         )
 
     async def _busy_moa_command(self, event: MessageEvent, quick_key: str, source):
@@ -1275,6 +1276,7 @@ class GatewayBusySessionMixin:
                 message_id=event.message_id, channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context, edit_revision=event.edit_revision,
                 ephemeral_context_ref=event.ephemeral_context_ref,
+                _ephemeral_context_blocked=event._ephemeral_context_blocked,
             ), adapter, reply):
                 return None  # its commit sends the reply
             return reply

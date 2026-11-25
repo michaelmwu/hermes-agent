@@ -297,6 +297,8 @@ def row_turn_author(policy, row):
 
 
 async def execute_admission(authority, ref, row):
+    volatile_refs = getattr(authority, 'native_volatile_refs', {})
+    volatile_ref = volatile_refs.pop(row['admission_id'], None)
     busy_turn_started(row['admission_id'])
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
@@ -319,6 +321,7 @@ async def execute_admission(authority, ref, row):
     authority.native_waiters.discard(row['admission_id'])
     if 'native_text_v1' in row['payload']:
         event = restore_native(row['payload'], authority.runner)
+        event.ephemeral_context_ref = volatile_ref
     else:
         from gateway.session_ingress_media import restore_attachments
         event = MessageEvent(text=row['payload']['text'], source=live.source,

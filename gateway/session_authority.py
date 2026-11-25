@@ -158,6 +158,7 @@ class SessionAuthority:
         self.waiters = {}
         self.events = {}
         self.native_waiters = set()
+        self.native_volatile_refs = {}  # admission id -> opaque adapter reference, never persisted
         self.pending_results = {}
         # Replies of recovered no-waiter turns, sent only once their terminal outcome commits.
         self.pending_deliveries = {}
@@ -622,10 +623,18 @@ class SessionAuthority:
         from gateway import session_retry_admission
         rewrite = session_retry_admission.take(event, authority_persistence(self))
 
-        def admitted(row):
+        def admitted(result):
+            row, created = result
             committed[0] = SessionRef(self.profile_id, row.get('target_session_id') or ref.session_id)
             if rewrite is not None and rewrite.applied:
                 rewrite.on_commit()
+            # Only a newly admitted message can carry its live capability into this process's
+            # drain. A replay or restarted drain can run the saved message without it.
+            volatile_ref = getattr(event, 'ephemeral_context_ref', None)
+            if created and volatile_ref is not None and not getattr(event, '_ephemeral_context_blocked', False):
+                self.native_volatile_refs[row['admission_id']] = volatile_ref
+                if len(self.native_volatile_refs) > 4096:
+                    self.native_volatile_refs.pop(next(iter(self.native_volatile_refs)))
             return self._admitted(committed[0], event, row)
         from gateway.session_ingress_media import _lease_scope
         if (scope := _lease_scope.get()) is not None:
@@ -654,7 +663,7 @@ class SessionAuthority:
                                                   rewrite=rewrite.rewrite if rewrite is not None else None)
             if rewrite is not None:
                 rewrite.applied = created
-            return admission_row(row)
+            return admission_row(row), created
         except Exception:
             # A refused admission owns nothing it captured (unless another admission holds the same bytes).
             drop_capture_lease()

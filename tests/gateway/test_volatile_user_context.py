@@ -95,3 +95,40 @@ async def test_recursive_queued_turn_resolves_its_ref_at_its_own_boundary():
     assert kwargs["inbound_message_id"] == "telegram-2"
     assert kwargs["volatile_user_context"].endswith("Longitude: 2")
     assert kwargs["message"] == "find coffee nearby"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("authority_cwd_in_tmp")
+async def test_native_fifo_carries_reference_to_execution_without_serializing_it(monkeypatch):
+    from tests.gateway.test_messaging_slash_command_fifo import _start_a
+    from tests.waiting import async_wait_until
+
+    rig = await _start_a(monkeypatch, "steer")
+    seen = []
+    run_turn = rig.runner._handle_message_with_agent
+
+    async def capture(event, *args):
+        seen.append(event.ephemeral_context_ref)
+        return await run_turn(event, *args)
+
+    monkeypatch.setattr(rig.runner, "_handle_message_with_agent", capture)
+    reference = object()
+    event = MessageEvent(
+        text="where am I?", source=rig.source, message_id="B", ephemeral_context_ref=reference
+    )
+    try:
+        await rig.adapter.handle_message(event)
+        session_id = rig.runner.session_store.peek_session_id(rig.key)
+
+        def pending():
+            rows = rig.authority.persistence.admissions.list(session_id=session_id)
+            return next((row for row in rows if row.request_id == "B"), None)
+
+        await async_wait_until(pending, what="the volatile-context turn to enter the FIFO")
+        assert "ephemeral_context_ref" not in pending().payload["native_text_v1"]["event"]
+        assert not seen
+        rig.finish.set()
+        await async_wait_until(lambda: ("B", True) in rig.order, what="the queued turn to run")
+        assert seen == [reference]
+    finally:
+        rig.finish.set()
